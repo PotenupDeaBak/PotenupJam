@@ -64,8 +64,13 @@ void AJamClient::Connect()
 {
 	UE_LOG(LogTemp, Log, TEXT("AJamClient: Connecting to %s"), *ServerURL);
 
-	// 두 번째 인자(Protocol)를 빈 문자열로 변경
-	Socket = FWebSocketsModule::Get().CreateWebSocket(ServerURL, TEXT(""));
+	// 일부 서버는 핸드셰이크 단계(연결 전)에서 특정 헤더를 요구합니다.
+	TMap<FString, FString> UpgradeHeaders;
+	UpgradeHeaders.Add(TEXT("type"), TEXT("register"));
+	UpgradeHeaders.Add(TEXT("role"), TEXT("unreal"));
+
+	// 두 번째 인자(Protocol)를 빈 문자열로, 세 번째 인자(Headers)를 추가하여 생성
+	Socket = FWebSocketsModule::Get().CreateWebSocket(ServerURL, TEXT(""), UpgradeHeaders);
 
 	// 이벤트 바인딩
 	Socket->OnConnected().AddUObject(this, &AJamClient::OnConnected);
