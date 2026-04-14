@@ -1,4 +1,5 @@
 #include "JamClient.h"
+#include "Camera/CameraActor.h" // 가상 카메라 액터 사용을 위한 필수 헤더
 #include "WebSocketsModule.h"
 #include "Json.h"
 #include "JsonUtilities.h"
@@ -6,7 +7,7 @@
 #include "Kismet/KismetMathLibrary.h"
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
-#include "Async/Async.h" // AsyncTask 사용을 위한 필수 헤더
+#include "Async/Async.h"
 
 AJamClient::AJamClient()
 {
@@ -15,38 +16,41 @@ AJamClient::AJamClient()
 
 void AJamClient::BeginPlay()
 {
-    Super::BeginPlay();
+   Super::BeginPlay();
     
-    if (!FModuleManager::Get().IsModuleLoaded("WebSockets"))
-    {
-       FModuleManager::Get().LoadModule("WebSockets");
-    }
-    
-    FString DefaultSeat = TEXT("A1");
-    AActor* FoundActor = nullptr;
-    
-    for (TActorIterator<AActor> It(GetWorld()); It; ++It)
-    {
-       AActor* Actor = *It;
-#if WITH_EDITOR
-       if (Actor && (Actor->GetName() == DefaultSeat || Actor->GetActorLabel() == DefaultSeat))
-#else
-       if (Actor && Actor->GetName() == DefaultSeat)
-#endif
+   if (!FModuleManager::Get().IsModuleLoaded("WebSockets"))
+   {
+      FModuleManager::Get().LoadModule("WebSockets");
+   }
+
+   // [해결책] Standalone에서는 BeginPlay 즉시 실행 시 뷰가 초기화될 수 있으므로
+   // 0.2~0.5초 정도 지연 후에 초기 카메라 위치를 잡도록 타이머를 설정합니다.
+   FTimerHandle InitTimerHandle;
+   GetWorldTimerManager().SetTimer(InitTimerHandle, [this]()
+   {
+       // 1. 태그를 기반으로 좌석 찾기 (Standalone에서 가장 안전한 방법)
+       FString DefaultSeat = TEXT("A3");
+       AActor* FoundActor = nullptr;
+        
+       for (TActorIterator<AActor> It(GetWorld()); It; ++It)
        {
-          FoundActor = Actor;
-          break;
+           AActor* Actor = *It;
+           // GetActorLabel() 대신 ActorHasTag를 우선적으로 사용합니다.
+           if (Actor && (Actor->ActorHasTag(FName(*DefaultSeat)) || Actor->GetName() == DefaultSeat))
+           {
+               FoundActor = Actor;
+               break;
+           }
        }
-    }
-    
-    APlayerController* PC = UGameplayStatics::GetPlayerController(GetWorld(), 0);
-    if (PC && FoundActor)
-    {
-       PC->SetViewTargetWithBlend(FoundActor, BlendTime);
-       LookAtScreen(PC, FoundActor);
-    }
-    
-    Connect();
+        
+       APlayerController* PC = UGameplayStatics::GetPlayerController(GetWorld(), 0);
+       if (PC && FoundActor)
+       {
+           LookAtScreen(PC, FoundActor);
+       }
+   }, 0.2f, false);
+
+   Connect();
 }
 
 void AJamClient::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -64,7 +68,6 @@ void AJamClient::Connect()
 {
     UE_LOG(LogTemp, Log, TEXT("AJamClient: Connecting to %s"), *ServerURL);
 
-    // 두 번째 인자(Subprotocol)를 TEXT("")로 비워야 순수 표준 웹소켓으로 연결됩니다.
     Socket = FWebSocketsModule::Get().CreateWebSocket(ServerURL, TEXT(""));
 
     Socket->OnConnected().AddUObject(this, &AJamClient::OnConnected);
@@ -77,26 +80,19 @@ void AJamClient::Connect()
 
 void AJamClient::OnConnected()
 {
-    UE_LOG(LogTemp, Log, TEXT("AJamClient: Connected successfully. Sending registration JSON..."));
+    UE_LOG(LogTemp, Log, TEXT("AJamClient: Connected successfully. Sending registration message..."));
 
-    // 1. JSON 객체 생성
     TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject());
-    
-    // 2. 서버가 요구하는 Key-Value 세팅: {"type": "register", "role": "unreal"}
     RootObject->SetStringField(TEXT("type"), TEXT("register"));
     RootObject->SetStringField(TEXT("role"), TEXT("unreal"));
 
-    // 3. JSON 객체를 텍스트(String)로 직렬화(변환)
     FString OutputString;
     TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
     FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
 
-    UE_LOG(LogTemp, Warning, TEXT("AJamClient: Register payload = %s"), *OutputString);
-    
-    // 4. 변환된 문자열을 웹소켓 서버로 전송
     if (Socket.IsValid())
     {
-        Socket->Send(OutputString);
+       Socket->Send(OutputString);
     }
 }
 
@@ -112,17 +108,12 @@ void AJamClient::OnClosed(int32 StatusCode, const FString& Reason, bool bWasClea
 
 void AJamClient::OnMessage(const FString& Message)
 {
-    UE_LOG(LogTemp, Log, TEXT("AJamClient: Received data: %s"), *Message);
-
-    // [핵심 수정] 네트워크 백그라운드 스레드에서 수신한 데이터를 Game Thread로 디스패치
-    // 이를 누락하면 GetWorld() 및 Actor 조작 시 스레드 충돌로 엔진이 즉시 크래시됩니다.
     AsyncTask(ENamedThreads::GameThread, [this, Message]()
     {
-        // 비동기 실행 시점에 이 액터(AJamClient)가 파괴되지 않고 유효한지 검사
-        if (IsValid(this))
-        {
-            ProcessSocketData(Message);
-        }
+       if (IsValid(this))
+       {
+          ProcessSocketData(Message);
+       }
     });
 }
 
@@ -133,49 +124,47 @@ void AJamClient::ProcessSocketData(const FString& JsonString)
 
     if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
     {
-        // 서버에서 전달하는 메시지 타입 확인
-        FString MsgType;
-        if (JsonObject->TryGetStringField(TEXT("type"), MsgType))
-        {
-            // 좌석 하이라이트 이벤트인 경우에만 처리
-            if (MsgType == TEXT("highlight_seat"))
-            {
-                FString TargetSeat;
-                if (JsonObject->TryGetStringField(TEXT("seat_id"), TargetSeat))
-                {
-                    UE_LOG(LogTemp, Log, TEXT("AJamClient: Executing View Transition to %s"), *TargetSeat);
+       FString MsgType;
+       if (JsonObject->TryGetStringField(TEXT("type"), MsgType) && MsgType == TEXT("highlight_seat"))
+       {
+          FString TargetSeat;
+          if (JsonObject->TryGetStringField(TEXT("seat_id"), TargetSeat))
+          {
+             UE_LOG(LogTemp, Log, TEXT("AJamClient: Switching view to seat %s"), *TargetSeat);
 
-                    AActor* FoundActor = nullptr;
-                    for (TActorIterator<AActor> It(GetWorld()); It; ++It)
-                    {
-                        AActor* Actor = *It;
+             AActor* FoundActor = nullptr;
+             for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+             {
+                AActor* Actor = *It;
+                if (Actor && (Actor->GetName() == TargetSeat || 
+                           Actor->ActorHasTag(FName(*TargetSeat)) ||
 #if WITH_EDITOR
-                        if (Actor && (Actor->GetName() == TargetSeat || Actor->GetActorLabel() == TargetSeat))
+                           Actor->GetActorLabel() == TargetSeat
 #else
-                        if (Actor && Actor->GetName() == TargetSeat)
+                           false
 #endif
-                        {
-                            FoundActor = Actor;
-                            break;
-                        }
-                    }
-
-                    if (FoundActor)
-                    {
-                        APlayerController* PC = UGameplayStatics::GetPlayerController(GetWorld(), 0);
-                        if (PC)
-                        {
-                            PC->SetViewTargetWithBlend(FoundActor, BlendTime);
-                            LookAtScreen(PC, FoundActor);
-                        }
-                    }
-                    else
-                    {
-                        UE_LOG(LogTemp, Warning, TEXT("AJamClient: Target Actor [%s] not found in world."), *TargetSeat);
-                    }
+                   ))
+                {
+                   FoundActor = Actor;
+                   break;
                 }
-            }
-        }
+             }
+
+             if (FoundActor)
+             {
+                APlayerController* PC = UGameplayStatics::GetPlayerController(GetWorld(), 0);
+                if (PC)
+                {
+                   // 여기서 직접 블렌딩하지 않고 LookAtScreen으로 통제권을 넘깁니다.
+                   LookAtScreen(PC, FoundActor);
+                }
+             }
+             else
+             {
+                UE_LOG(LogTemp, Warning, TEXT("AJamClient: Actor for seat %s not found."), *TargetSeat);
+             }
+          }
+       }
     }
     else
     {
@@ -191,24 +180,58 @@ void AJamClient::LookAtScreen(APlayerController* PC, AActor* ViewTarget)
     for (TActorIterator<AActor> It(GetWorld()); It; ++It)
     {
        AActor* Actor = *It;
+       if (Actor && (Actor->GetName() == TargetScreen || 
+                  Actor->ActorHasTag(FName(*TargetScreen)) ||
 #if WITH_EDITOR
-       if (Actor && (Actor->GetName() == TargetScreen || Actor->GetActorLabel() == TargetScreen))
+                  Actor->GetActorLabel() == TargetScreen
 #else
-       if (Actor && Actor->GetName() == TargetScreen)
+                  false
 #endif
+          ))
        {
           ScreenActor = Actor;
           break;
        }
     }
 
-    if (ScreenActor)
-    {
-       FRotator LookAtRot = UKismetMathLibrary::FindLookAtRotation(ViewTarget->GetActorLocation(), ScreenActor->GetActorLocation());
-       
-       PC->SetControlRotation(LookAtRot);
-       ViewTarget->SetActorRotation(LookAtRot);
+   if (ScreenActor)
+   {
+      // 1. 시선의 시작점 (의자 기준 사람 눈높이)
+      FVector EyeLocation = ViewTarget->GetActorLocation() + FVector(10.0f, 0.0f, 120.0f);
 
-       UE_LOG(LogTemp, Log, TEXT("AJamClient: Rotated %s to look at %s"), *ViewTarget->GetName(), *ScreenActor->GetName());
-    }
+      // 2. [수정됨] 복잡한 Bounds 계산 없이, Target Point의 정확한 좌표를 그대로 사용!
+      FVector ScreenCenter = ScreenActor->GetActorLocation();
+
+      // 3. 눈높이에서 타겟 포인트를 바라보는 회전 각도 산출
+      FRotator LookAtRot = UKismetMathLibrary::FindLookAtRotation(EyeLocation, ScreenCenter);
+
+      // 핑퐁 가상 카메라 로직
+      static bool bUseCamA = true;
+      FName CamTag = bUseCamA ? TEXT("VirtualCamA") : TEXT("VirtualCamB");
+      bUseCamA = !bUseCamA;
+
+      ACameraActor* TargetCamera = nullptr;
+      for (TActorIterator<ACameraActor> It(GetWorld()); It; ++It)
+      {
+         if (It->ActorHasTag(CamTag))
+         {
+            TargetCamera = *It;
+            break;
+         }
+      }
+
+      if (!TargetCamera)
+      {
+         TargetCamera = GetWorld()->SpawnActor<ACameraActor>();
+         TargetCamera->Tags.Add(CamTag);
+      }
+
+      // 카메라 세팅 및 뷰 블렌딩 전환
+      TargetCamera->SetActorLocationAndRotation(EyeLocation, LookAtRot);
+      PC->SetControlRotation(LookAtRot);
+      PC->SetViewTargetWithBlend(TargetCamera, BlendTime);
+
+      // 정확한 조준점 로그 출력
+      UE_LOG(LogTemp, Log, TEXT("AJamClient: Virtual Camera is looking at EXACT Point: %s"), *ScreenCenter.ToString());
+   }
 }
